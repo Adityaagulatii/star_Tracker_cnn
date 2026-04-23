@@ -1,0 +1,7 @@
+__pycache__/
+data/
+checkpoints/
+outputs/
+*.png
+make_notebook.py
+plot_*.py
