@@ -241,13 +241,16 @@ class ELUUp(nn.Module):
 
 class ELUNet(nn.Module):
     """
-    Lightest of the three. Single conv per block + smaller base channels.
-    Trains fastest, fewest parameters.
+    Best model: lightest architecture + dual output for sub-pixel centroiding.
+    Based on: arXiv:2404.19108 — Deep Learning for Star Detection in CubeSat Star Trackers.
+
+    Channel 0: segmentation probability  (sigmoid applied, [0,1])
+    Channel 1: distance map regression   (raw, pixels to nearest star boundary)
 
     Input:  (B, 1, H, W)
-    Output: (B, 1, H, W)  values in [0, 1]
+    Output: (B, 2, H, W)
     """
-    def __init__(self, in_ch=1, out_ch=1, base_ch=8):
+    def __init__(self, in_ch=1, out_ch=2, base_ch=8):
         super().__init__()
 
         self.inc        = SingleConv(in_ch,        base_ch)
@@ -269,11 +272,13 @@ class ELUNet(nn.Module):
 
         x4 = self.bottleneck(x3)
 
-        x  = self.up1(x4, x3)
-        x  = self.up2(x,  x2)
-        x  = self.up3(x,  x1)
-
-        return torch.sigmoid(self.outc(x))
+        x   = self.up1(x4, x3)
+        x   = self.up2(x,  x2)
+        x   = self.up3(x,  x1)
+        raw = self.outc(x)
+        seg  = torch.sigmoid(raw[:, 0:1])   # star probability  [0, 1]
+        dist = raw[:, 1:2]                  # distance map      (unbounded)
+        return torch.cat([seg, dist], dim=1)
 
 
 # ==========================

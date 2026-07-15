@@ -1,11 +1,10 @@
 """
-evaluate.py — test all three models on the validation set.
+evaluate.py — test all models; ELUNet uses trilateration on the dist map.
 
 Usage:  python evaluate.py
 """
 
-import time
-import random
+import time, random
 from pathlib import Path
 
 import matplotlib
@@ -13,32 +12,75 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from scipy.ndimage import label, center_of_mass
+from scipy.ndimage import label, center_of_mass, minimum_filter
 from torch.utils.data import DataLoader
 
 from dataset import StarDataset
 from model   import UNet, MobileUNet, ELUNet
 
 MODELS       = {'unet': UNet, 'mobileunet': MobileUNet, 'elunet': ELUNet}
-THRESHOLD    = 0.5    # probability cutoff to call a pixel a star
-MATCH_RADIUS = 5      # pixels — predicted star must be within this to count as TP
+THRESHOLD    = 0.5
+MATCH_RADIUS = 5
 
 
 # ── Centroid extraction ───────────────────────────────────────────────────────
 
-def get_centroids(seg_map):
-    """Find star centres from a binary-ish seg map using connected components."""
-    binary         = (seg_map > THRESHOLD).astype(np.int32)
-    labeled, n     = label(binary)
-    cents = []
-    for i in range(1, n + 1):
-        cy, cx = center_of_mass(binary, labels=labeled, index=i)
-        cents.append((cx, cy))
-    return cents
+def get_centroids_com(seg_map: np.ndarray) -> list[tuple[float, float]]:
+    """Center-of-mass — used for UNet and MobileUNet (single-channel output)."""
+    binary     = (seg_map > THRESHOLD).astype(np.int32)
+    labeled, n = label(binary)
+    return [(float(cx), float(cy))
+            for cy, cx in [center_of_mass(binary, labels=labeled, index=i)
+                           for i in range(1, n + 1)]]
+
+
+def get_centroids_trilateration(seg: np.ndarray, dist: np.ndarray,
+                                radius: int = 5) -> list[tuple[float, float]]:
+    """
+    Sub-pixel trilateration on the distance map — used for ELUNet dual output.
+    Based on: arXiv:2404.19108
+    """
+    binary = (seg > THRESHOLD).astype(np.float32)
+    coarse = (dist <= 2.0) & (binary > 0)
+    nms    = (dist == minimum_filter(dist, size=9)) & coarse
+    seeds  = np.argwhere(nms)
+    centroids: list[tuple[float, float]] = []
+    visited = np.zeros_like(binary, dtype=bool)
+
+    for (row0, col0) in seeds:
+        if visited[row0, col0]:
+            continue
+        H, W = binary.shape
+        r0, r1 = max(0, row0 - radius), min(H, row0 + radius + 1)
+        c0, c1 = max(0, col0 - radius), min(W, col0 + radius + 1)
+        patch_seg  = binary[r0:r1, c0:c1]
+        patch_dist = dist[r0:r1, c0:c1]
+        rows, cols = np.where(patch_seg > 0)
+        if len(rows) < 3:
+            centroids.append((float(col0), float(row0)))
+            visited[r0:r1, c0:c1] |= patch_seg.astype(bool)
+            continue
+        abs_rows = rows + r0; abs_cols = cols + c0
+        dists    = patch_dist[rows, cols]
+        ref      = np.argmin(dists)
+        y0, x0   = float(abs_rows[ref]), float(abs_cols[ref])
+        d0       = dists[ref]
+        mask     = np.arange(len(rows)) != ref
+        yi = abs_rows[mask].astype(float); xi = abs_cols[mask].astype(float)
+        di = dists[mask]
+        A  = 2 * np.column_stack([xi - x0, yi - y0])
+        b  = (xi**2 - x0**2) + (yi**2 - y0**2) - (di**2 - d0**2)
+        if A.shape[0] >= 2:
+            res, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+            cx, cy = x0 + res[0], y0 + res[1]
+        else:
+            cx, cy = x0, y0
+        centroids.append((float(cx), float(cy)))
+        visited[r0:r1, c0:c1] |= patch_seg.astype(bool)
+    return centroids
 
 
 def match(pred_cents, true_cents, radius):
-    """Greedy nearest-neighbour matching. Returns TP, FP, FN, error list."""
     matched = set()
     tp, errors = 0, []
     for px, py in pred_cents:
@@ -50,12 +92,8 @@ def match(pred_cents, true_cents, radius):
             if d < best_d:
                 best_d, best_j = d, j
         if best_j >= 0 and best_d <= radius:
-            tp += 1
-            matched.add(best_j)
-            errors.append(best_d)
-    fp = len(pred_cents) - tp
-    fn = len(true_cents)  - tp
-    return tp, fp, fn, errors
+            tp += 1; matched.add(best_j); errors.append(best_d)
+    return tp, len(pred_cents) - tp, len(true_cents) - tp, errors
 
 
 # ── Evaluate one model ────────────────────────────────────────────────────────
@@ -65,8 +103,9 @@ def evaluate(model_name, device):
     if not ckpt.exists():
         return None
 
-    model = MODELS[model_name]().to(device)
-    model.load_state_dict(torch.load(ckpt, map_location=device))
+    model     = MODELS[model_name]().to(device)
+    dual_out  = (model_name == 'elunet')
+    model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
     model.eval()
 
     loader = DataLoader(StarDataset('data/val'), batch_size=1,
@@ -76,25 +115,27 @@ def evaluate(model_name, device):
     all_errors, times = [], []
 
     with torch.no_grad():
-        for images, segs in loader:
+        for images, segs, _ in loader:
             images = images.to(device)
-
-            t0 = time.perf_counter()
-            pred = model(images)
+            t0     = time.perf_counter()
+            pred   = model(images)
             if device.type == 'cuda':
                 torch.cuda.synchronize()
             times.append((time.perf_counter() - t0) * 1000)
 
-            pred_np = pred[0, 0].cpu().numpy()
             true_np = segs[0, 0].numpy()
+            true_c  = get_centroids_com(true_np)
 
-            pred_c = get_centroids(pred_np)
-            true_c = get_centroids(true_np)
+            if dual_out:
+                pred_c = get_centroids_trilateration(
+                    pred[0, 0].cpu().numpy(),
+                    pred[0, 1].cpu().numpy()
+                )
+            else:
+                pred_c = get_centroids_com(pred[0, 0].cpu().numpy())
 
             tp, fp, fn, errs = match(pred_c, true_c, MATCH_RADIUS)
-            tp_tot += tp
-            fp_tot += fp
-            fn_tot += fn
+            tp_tot += tp; fp_tot += fp; fn_tot += fn
             all_errors.extend(errs)
 
     precision = tp_tot / (tp_tot + fp_tot + 1e-8)
@@ -103,112 +144,9 @@ def evaluate(model_name, device):
     mean_err  = float(np.mean(all_errors)) if all_errors else float('nan')
     mean_time = float(np.mean(times[5:])) if len(times) > 5 else float(np.mean(times))
     params    = sum(p.numel() for p in model.parameters())
-
     return dict(f1=f1, precision=precision, recall=recall,
-                mean_err=mean_err, time_ms=mean_time, params=params)
-
-
-# ── Visual predictions on 2 random val images ─────────────────────────────────
-
-def save_img(arr, path):
-    """Save a single 2D array as a clean black/white PNG, no borders."""
-    binary = (arr > THRESHOLD).astype(np.float32)
-    fig, ax = plt.subplots(figsize=(4, 4))
-    fig.patch.set_facecolor('black')
-    ax.imshow(binary, cmap="gray", origin="lower", vmin=0, vmax=1)
-    ax.axis("off")
-    plt.savefig(path, dpi=150, bbox_inches='tight',
-                pad_inches=0, facecolor='black')
-    plt.close()
-
-
-def visualise(device):
-    val_paths = sorted(Path("data/val").glob("image_*.npy"))
-    random.seed(99)
-    picks = random.sample(val_paths, min(2, len(val_paths)))
-
-    loaded = {}
-    for name, Cls in MODELS.items():
-        ckpt = Path(f"checkpoints/{name}_best.pth")
-        if not ckpt.exists():
-            continue
-        m = Cls().to(device)
-        m.load_state_dict(torch.load(ckpt, map_location=device))
-        m.eval()
-        loaded[name] = m
-
-    for path in picks:
-        idx   = path.stem.split("_")[1]
-        image = np.load(path)
-        seg   = np.load(Path("data/val") / f"seg_{idx}.npy")
-        img_t = torch.from_numpy(image).unsqueeze(0).unsqueeze(0).to(device)
-
-        # Raw image
-        fig, ax = plt.subplots(figsize=(4, 4))
-        fig.patch.set_facecolor('black')
-        ax.imshow(image, cmap="gray", origin="lower", vmin=0, vmax=1)
-        ax.axis("off")
-        plt.savefig(f"val_{idx}_input.png", dpi=150,
-                    bbox_inches='tight', pad_inches=0, facecolor='black')
-        plt.close()
-
-        # Ground truth
-        save_img(seg, f"val_{idx}_groundtruth.png")
-
-        # Each model
-        for name, m in loaded.items():
-            with torch.no_grad():
-                pred = m(img_t)[0, 0].cpu().numpy()
-            save_img(pred, f"val_{idx}_{name}.png")
-
-        print(f"Saved 5 images for sample {idx}")
-
-
-# ── Unseen image test ────────────────────────────────────────────────────────
-
-def unseen_test(device, out="unseen_test.png"):
-    """Download one brand-new sky image and show all three model outputs."""
-    from prepare_data import download_image, make_seg
-    import random as _r
-
-    print("\nDownloading unseen test image...")
-    _r.seed(2025)
-    image = None
-    while image is None:
-        ra, dec = _r.uniform(0, 360), _r.uniform(-60, 60)
-        image   = download_image(ra, dec)
-
-    seg_gt = make_seg(image)
-    img_t  = torch.from_numpy(image).unsqueeze(0).unsqueeze(0).to(device)
-
-    fig, axes = plt.subplots(1, len(MODELS) + 2, figsize=(5 * (len(MODELS) + 2), 5))
-    fig.patch.set_facecolor('#0d0d0d')
-
-    # Raw input
-    fig, ax = plt.subplots(figsize=(4, 4))
-    fig.patch.set_facecolor('black')
-    ax.imshow(image, cmap="gray", origin="lower", vmin=0, vmax=1)
-    ax.axis("off")
-    plt.savefig("unseen_input.png", dpi=150,
-                bbox_inches='tight', pad_inches=0, facecolor='black')
-    plt.close()
-
-    # Ground truth
-    save_img(seg_gt, "unseen_groundtruth.png")
-
-    # Each model
-    for name, Cls in MODELS.items():
-        ckpt = Path(f"checkpoints/{name}_best.pth")
-        if not ckpt.exists():
-            continue
-        m = Cls().to(device)
-        m.load_state_dict(torch.load(ckpt, map_location=device))
-        m.eval()
-        with torch.no_grad():
-            pred = m(img_t)[0, 0].cpu().numpy()
-        save_img(pred, f"unseen_{name}.png")
-
-    print("Saved: unseen_input.png  unseen_groundtruth.png  unseen_unet.png  unseen_mobileunet.png  unseen_elunet.png")
+                mean_err=mean_err, time_ms=mean_time, params=params,
+                centroid='trilateration' if dual_out else 'center-of-mass')
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -216,24 +154,13 @@ def unseen_test(device, out="unseen_test.png"):
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nEvaluating on {device}\n")
-
-    # Metrics table
-    header = f"{'Model':<14}{'F1':>7}{'Err(px)':>10}{'ms/img':>9}"
-    print(header)
-    print('-' * len(header))
+    print(f"{'Model':<14}{'F1':>7}{'Err(px)':>10}{'ms/img':>9}{'Centroiding'}")
+    print('-' * 55)
 
     for name in MODELS:
         r = evaluate(name, device)
         if r is None:
-            print(f"{name:<14}  no checkpoint found")
+            print(f"{name:<14}  no checkpoint")
             continue
-        print(f"{name:<14}"
-              f"{r['f1']:>7.3f}"
-              f"{r['mean_err']:>10.2f}"
-              f"{r['time_ms']:>9.1f}")
-
-    # Visual output on val samples
-    visualise(device)
-
-    # Unseen image test
-    unseen_test(device)
+        print(f"{name:<14}{r['f1']:>7.3f}{r['mean_err']:>10.2f}"
+              f"{r['time_ms']:>9.1f}  {r['centroid']}")
