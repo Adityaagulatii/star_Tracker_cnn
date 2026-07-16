@@ -28,7 +28,7 @@ from quantize.lsq        import replace_conv2d_with_lsq
 from quantize.static_int8 import make_int8
 
 VAL_DIR      = "data/val"
-FP32_CKPT    = "checkpoints/elunet_best.pth"
+FP32_CKPT    = "checkpoints/elunet_fp32.pth"
 LSQ_CKPT     = "checkpoints/elunet_lsq.pth"
 SEG_THRESH   = 0.5
 MATCH_RADIUS = 5
@@ -36,39 +36,46 @@ MATCH_RADIUS = 5
 
 # ── Centroid extraction (trilateration) ──────────────────────────────────────
 
-def trilaterate(seg: np.ndarray, dist: np.ndarray, radius: int = 5):
-    binary = (seg > SEG_THRESH).astype(np.float32)
-    coarse = (dist <= 2.0) & (binary > 0)
-    nms    = (dist == minimum_filter(dist, size=9)) & coarse
-    seeds  = np.argwhere(nms)
-    cents  = []
-    visited = np.zeros_like(binary, dtype=bool)
-    for (r0, c0) in seeds:
-        if visited[r0, c0]:
+def trilaterate(seg: np.ndarray, dist: np.ndarray, radius: int = 7):
+    """Per-blob peak-seeded trilateration — robust sub-pixel centroiding."""
+    binary     = (seg > SEG_THRESH).astype(np.float32)
+    labeled, n = label(binary)
+    if n == 0:
+        return []
+    cents = []
+    for i in range(1, n + 1):
+        blob = labeled == i
+        if blob.sum() < 2:
             continue
-        H, W = binary.shape
-        rs, re = max(0, r0-radius), min(H, r0+radius+1)
-        cs, ce = max(0, c0-radius), min(W, c0+radius+1)
-        pseg = binary[rs:re, cs:ce]; pdist = dist[rs:re, cs:ce]
+        dist_blob = np.where(blob, dist, -np.inf)
+        r0, c0   = np.unravel_index(np.argmax(dist_blob), dist_blob.shape)
+        H, W     = binary.shape
+        rs, re   = max(0, r0-radius), min(H, r0+radius+1)
+        cs, ce   = max(0, c0-radius), min(W, c0+radius+1)
+        pseg     = binary[rs:re, cs:ce]
+        pdist    = dist[rs:re, cs:ce]
         rows, cols = np.where(pseg > 0)
         if len(rows) < 3:
             cents.append((float(c0), float(r0)))
-            visited[rs:re, cs:ce] |= pseg.astype(bool)
             continue
-        ar = rows + rs; ac = cols + cs; ds = pdist[rows, cols]
-        ref = np.argmin(ds)
-        y0, x0, d0 = float(ar[ref]), float(ac[ref]), ds[ref]
-        m = np.arange(len(rows)) != ref
-        yi, xi, di = ar[m].astype(float), ac[m].astype(float), ds[m]
-        A = 2 * np.column_stack([xi - x0, yi - y0])
-        b = (xi**2 - x0**2) + (yi**2 - y0**2) - (di**2 - d0**2)
+        ar = rows+rs; ac = cols+cs; ds = pdist[rows, cols]
+        pos = ds > 0
+        if not pos.any():
+            cents.append((float(c0), float(r0)))
+            continue
+        ref  = np.where(pos)[0][np.argmin(ds[pos])]
+        y0_, x0_, d0_ = float(ar[ref]), float(ac[ref]), float(ds[ref])
+        m    = np.arange(len(rows)) != ref
+        yi   = ar[m].astype(float); xi = ac[m].astype(float); di = ds[m]
+        A    = 2 * np.column_stack([xi - x0_, yi - y0_])
+        b    = (xi**2 - x0_**2) + (yi**2 - y0_**2) - (di**2 - d0_**2)
         if A.shape[0] >= 2:
             res, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-            cx, cy = x0 + res[0], y0 + res[1]
+            cx = float(np.clip(x0_ + res[0], 0, W-1))
+            cy = float(np.clip(y0_ + res[1], 0, H-1))
         else:
-            cx, cy = x0, y0
-        cents.append((float(cx), float(cy)))
-        visited[rs:re, cs:ce] |= pseg.astype(bool)
+            cx, cy = float(c0), float(r0)
+        cents.append((cx, cy))
     return cents
 
 

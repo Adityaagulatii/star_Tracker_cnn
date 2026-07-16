@@ -35,48 +35,49 @@ def get_centroids_com(seg_map: np.ndarray) -> list[tuple[float, float]]:
 
 
 def get_centroids_trilateration(seg: np.ndarray, dist: np.ndarray,
-                                radius: int = 5) -> list[tuple[float, float]]:
+                                radius: int = 7) -> list[tuple[float, float]]:
     """
-    Sub-pixel trilateration on the distance map — used for ELUNet dual output.
+    Per-blob: peak of dist map gives seed, trilateration refines to sub-pixel.
     Based on: arXiv:2404.19108
     """
-    binary = (seg > THRESHOLD).astype(np.float32)
-    coarse = (dist <= 2.0) & (binary > 0)
-    nms    = (dist == minimum_filter(dist, size=9)) & coarse
-    seeds  = np.argwhere(nms)
-    centroids: list[tuple[float, float]] = []
-    visited = np.zeros_like(binary, dtype=bool)
-
-    for (row0, col0) in seeds:
-        if visited[row0, col0]:
+    binary    = (seg > THRESHOLD).astype(np.float32)
+    labeled, n = label(binary)
+    if n == 0:
+        return []
+    centroids = []
+    for i in range(1, n + 1):
+        mask_blob = labeled == i
+        if mask_blob.sum() < 2:
             continue
-        H, W = binary.shape
-        r0, r1 = max(0, row0 - radius), min(H, row0 + radius + 1)
-        c0, c1 = max(0, col0 - radius), min(W, col0 + radius + 1)
-        patch_seg  = binary[r0:r1, c0:c1]
-        patch_dist = dist[r0:r1, c0:c1]
-        rows, cols = np.where(patch_seg > 0)
+        dist_blob = np.where(mask_blob, dist, -np.inf)
+        r0, c0   = np.unravel_index(np.argmax(dist_blob), dist_blob.shape)
+        H, W     = binary.shape
+        rs, re   = max(0, r0-radius), min(H, r0+radius+1)
+        cs, ce   = max(0, c0-radius), min(W, c0+radius+1)
+        pseg     = binary[rs:re, cs:ce]
+        pdist    = dist[rs:re, cs:ce]
+        rows, cols = np.where(pseg > 0)
         if len(rows) < 3:
-            centroids.append((float(col0), float(row0)))
-            visited[r0:r1, c0:c1] |= patch_seg.astype(bool)
+            centroids.append((float(c0), float(r0)))
             continue
-        abs_rows = rows + r0; abs_cols = cols + c0
-        dists    = patch_dist[rows, cols]
-        ref      = np.argmin(dists)
-        y0, x0   = float(abs_rows[ref]), float(abs_cols[ref])
-        d0       = dists[ref]
-        mask     = np.arange(len(rows)) != ref
-        yi = abs_rows[mask].astype(float); xi = abs_cols[mask].astype(float)
-        di = dists[mask]
-        A  = 2 * np.column_stack([xi - x0, yi - y0])
-        b  = (xi**2 - x0**2) + (yi**2 - y0**2) - (di**2 - d0**2)
+        ar = rows + rs; ac = cols + cs; ds = pdist[rows, cols]
+        pos = ds > 0
+        if not pos.any():
+            centroids.append((float(c0), float(r0)))
+            continue
+        ref  = np.where(pos)[0][np.argmin(ds[pos])]
+        y0_  = float(ar[ref]); x0_ = float(ac[ref]); d0_ = float(ds[ref])
+        m    = np.arange(len(rows)) != ref
+        yi   = ar[m].astype(float); xi = ac[m].astype(float); di = ds[m]
+        A    = 2 * np.column_stack([xi - x0_, yi - y0_])
+        b    = (xi**2 - x0_**2) + (yi**2 - y0_**2) - (di**2 - d0_**2)
         if A.shape[0] >= 2:
             res, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-            cx, cy = x0 + res[0], y0 + res[1]
+            cx = float(np.clip(x0_ + res[0], 0, W-1))
+            cy = float(np.clip(y0_ + res[1], 0, H-1))
         else:
-            cx, cy = x0, y0
-        centroids.append((float(cx), float(cy)))
-        visited[r0:r1, c0:c1] |= patch_seg.astype(bool)
+            cx, cy = float(c0), float(r0)
+        centroids.append((cx, cy))
     return centroids
 
 
