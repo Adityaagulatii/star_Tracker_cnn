@@ -4,3 +4,9 @@ outputs/
 *.png
 make_notebook.py
 plot_*.py
+
+# Allow showcase images and readme assets for GitHub display
+!showcase/
+!showcase/**
+!sample.png
+!results/compare_results.png

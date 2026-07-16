@@ -104,9 +104,15 @@ def evaluate(model_name, device):
     if not ckpt.exists():
         return None
 
-    model     = MODELS[model_name]().to(device)
-    dual_out  = (model_name == 'elunet')
-    model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
+    state = torch.load(ckpt, map_location=device, weights_only=True)
+    if model_name == 'elunet':
+        out_ch   = state['outc.weight'].shape[0]
+        model    = MODELS[model_name](out_ch=out_ch).to(device)
+        dual_out = (out_ch == 2)
+    else:
+        model    = MODELS[model_name]().to(device)
+        dual_out = False
+    model.load_state_dict(state)
     model.eval()
 
     loader = DataLoader(StarDataset('data/val'), batch_size=1,
